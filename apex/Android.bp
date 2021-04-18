@@ -17,17 +17,26 @@ apex {
     arch: {
         arm64: {
             binaries: [
+                "authfs", // TODO(victorhsieh): move to microdroid once we can run the test in VM.
                 "crosvm",
             ],
         },
         x86_64: {
             binaries: [
+                "authfs", // TODO(victorhsieh): move to microdroid once we can run the test in VM.
                 "crosvm",
             ],
         },
     },
-    binaries: ["assemble_cvd"],
+    binaries: [
+        "assemble_cvd",
+        "fd_server",
+        "virtmanager",
+        "vm",
+    ],
     filesystems: ["microdroid"],
+    prebuilts: ["com.android.virt.init.rc"],
+    file_contexts: ":com.android.virt-file_contexts",
 }
 
 apex_key {
@@ -39,4 +48,10 @@ apex_key {
 android_app_certificate {
     name: "com.android.virt.certificate",
     certificate: "com.android.virt",
+}
+
+prebuilt_etc {
+    name: "com.android.virt.init.rc",
+    src: "virtmanager.rc",
+    filename: "init.rc",
 }

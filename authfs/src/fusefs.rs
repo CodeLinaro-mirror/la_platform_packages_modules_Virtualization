@@ -26,28 +26,45 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::Duration;
 
-use fuse::filesystem::{Context, DirEntry, DirectoryIterator, Entry, FileSystem, ZeroCopyWriter};
+use fuse::filesystem::{
+    Context, DirEntry, DirectoryIterator, Entry, FileSystem, FsOptions, ZeroCopyReader,
+    ZeroCopyWriter,
+};
 use fuse::mount::MountOption;
 
-use crate::common::{divide_roundup, COMMON_PAGE_SIZE};
-use crate::fsverity::FsverityChunkedFileReader;
-use crate::reader::{ChunkedFileReader, ReadOnlyDataByChunk};
-
-// We're reading the backing file by chunk, so setting the block size to be the same.
-const BLOCK_SIZE: usize = COMMON_PAGE_SIZE as usize;
+use crate::common::{divide_roundup, ChunkedSizeIter, CHUNK_SIZE};
+use crate::file::{
+    LocalFileReader, RandomWrite, ReadByChunk, RemoteFileEditor, RemoteFileReader,
+    RemoteMerkleTreeReader,
+};
+use crate::fsverity::{VerifiedFileEditor, VerifiedFileReader};
 
 const DEFAULT_METADATA_TIMEOUT: std::time::Duration = Duration::from_secs(5);
 
 pub type Inode = u64;
 type Handle = u64;
 
-// A debug only type where everything are stored as local files.
-type FileBackedFsverityChunkedFileReader =
-    FsverityChunkedFileReader<ChunkedFileReader, ChunkedFileReader>;
-
+/// `FileConfig` defines the file type supported by AuthFS.
 pub enum FileConfig {
-    LocalVerifiedFile(FileBackedFsverityChunkedFileReader, u64),
-    LocalUnverifiedFile(ChunkedFileReader, u64),
+    /// A file type that is verified against fs-verity signature (thus read-only). The file is
+    /// backed by a local file. Debug only.
+    LocalVerifiedReadonlyFile {
+        reader: VerifiedFileReader<LocalFileReader, LocalFileReader>,
+        file_size: u64,
+    },
+    /// A file type that is a read-only passthrough from a local file. Debug only.
+    LocalUnverifiedReadonlyFile { reader: LocalFileReader, file_size: u64 },
+    /// A file type that is verified against fs-verity signature (thus read-only). The file is
+    /// served from a remote server.
+    RemoteVerifiedReadonlyFile {
+        reader: VerifiedFileReader<RemoteFileReader, RemoteMerkleTreeReader>,
+        file_size: u64,
+    },
+    /// A file type that is a read-only passthrough from a file on a remote serrver.
+    RemoteUnverifiedReadonlyFile { reader: RemoteFileReader, file_size: u64 },
+    /// A file type that is initially empty, and the content is stored on a remote server. File
+    /// integrity is guaranteed with private Merkle tree.
+    RemoteVerifiedNewFile { editor: VerifiedFileEditor<RemoteFileEditor> },
 }
 
 struct AuthFs {
@@ -83,17 +100,26 @@ fn check_access_mode(flags: u32, mode: libc::c_int) -> io::Result<()> {
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))] {
-        fn blk_size() -> libc::c_int { BLOCK_SIZE as libc::c_int }
+        fn blk_size() -> libc::c_int { CHUNK_SIZE as libc::c_int }
     } else {
-        fn blk_size() -> libc::c_long { BLOCK_SIZE as libc::c_long }
+        fn blk_size() -> libc::c_long { CHUNK_SIZE as libc::c_long }
     }
 }
 
-fn create_stat(ino: libc::ino_t, file_size: u64) -> io::Result<libc::stat64> {
+enum FileMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+fn create_stat(ino: libc::ino_t, file_size: u64, file_mode: FileMode) -> io::Result<libc::stat64> {
     let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
 
     st.st_ino = ino;
-    st.st_mode = libc::S_IFREG | libc::S_IRUSR | libc::S_IRGRP | libc::S_IROTH;
+    st.st_mode = match file_mode {
+        // Until needed, let's just grant the owner access.
+        FileMode::ReadOnly => libc::S_IFREG | libc::S_IRUSR,
+        FileMode::ReadWrite => libc::S_IFREG | libc::S_IRUSR | libc::S_IWUSR,
+    };
     st.st_dev = 0;
     st.st_nlink = 1;
     st.st_uid = 0;
@@ -108,40 +134,11 @@ fn create_stat(ino: libc::ino_t, file_size: u64) -> io::Result<libc::stat64> {
     Ok(st)
 }
 
-/// An iterator that generates (offset, size) for a chunked read operation, where offset is the
-/// global file offset, and size is the amount of read from the offset.
-struct ChunkReadIter {
-    remaining: usize,
-    offset: u64,
-}
-
-impl ChunkReadIter {
-    pub fn new(remaining: usize, offset: u64) -> Self {
-        ChunkReadIter { remaining, offset }
-    }
-}
-
-impl Iterator for ChunkReadIter {
-    type Item = (u64, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let chunk_data_size =
-            std::cmp::min(self.remaining, BLOCK_SIZE - (self.offset % BLOCK_SIZE as u64) as usize);
-        let retval = (self.offset, chunk_data_size);
-        self.offset += chunk_data_size as u64;
-        self.remaining = self.remaining.saturating_sub(chunk_data_size);
-        Some(retval)
-    }
-}
-
 fn offset_to_chunk_index(offset: u64) -> u64 {
-    offset / BLOCK_SIZE as u64
+    offset / CHUNK_SIZE
 }
 
-fn read_chunks<W: io::Write, T: ReadOnlyDataByChunk>(
+fn read_chunks<W: io::Write, T: ReadByChunk>(
     mut w: W,
     file: &T,
     file_size: u64,
@@ -150,20 +147,20 @@ fn read_chunks<W: io::Write, T: ReadOnlyDataByChunk>(
 ) -> io::Result<usize> {
     let remaining = file_size.saturating_sub(offset);
     let size_to_read = std::cmp::min(size as usize, remaining as usize);
-    let total = ChunkReadIter::new(size_to_read, offset).try_fold(
+    let total = ChunkedSizeIter::new(size_to_read, offset, CHUNK_SIZE as usize).try_fold(
         0,
         |total, (current_offset, planned_data_size)| {
             // TODO(victorhsieh): There might be a non-trivial way to avoid this copy. For example,
             // instead of accepting a buffer, the writer could expose the final destination buffer
             // for the reader to write to. It might not be generally applicable though, e.g. with
             // virtio transport, the buffer may not be continuous.
-            let mut buf = [0u8; BLOCK_SIZE];
+            let mut buf = [0u8; CHUNK_SIZE as usize];
             let read_size = file.read_chunk(offset_to_chunk_index(current_offset), &mut buf)?;
             if read_size < planned_data_size {
                 return Err(io::Error::from_raw_os_error(libc::ENODATA));
             }
 
-            let begin = (current_offset % BLOCK_SIZE as u64) as usize;
+            let begin = (current_offset % CHUNK_SIZE) as usize;
             let end = begin + planned_data_size;
             let s = w.write(&buf[begin..end])?;
             if s != planned_data_size {
@@ -194,6 +191,12 @@ impl FileSystem for AuthFs {
         self.max_write
     }
 
+    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+        // Enable writeback cache for better performance especially since our bandwidth to the
+        // backend service is limited.
+        Ok(FsOptions::WRITEBACK_CACHE)
+    }
+
     fn lookup(&self, _ctx: Context, _parent: Inode, name: &CStr) -> io::Result<Entry> {
         // Only accept file name that looks like an integrer. Files in the pool are simply exposed
         // by their inode number. Also, there is currently no directory structure.
@@ -203,8 +206,15 @@ impl FileSystem for AuthFs {
         // be static.
         let inode = num.parse::<Inode>().map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
         let st = match self.get_file_config(&inode)? {
-            FileConfig::LocalVerifiedFile(_, file_size)
-            | FileConfig::LocalUnverifiedFile(_, file_size) => create_stat(inode, *file_size)?,
+            FileConfig::LocalVerifiedReadonlyFile { file_size, .. }
+            | FileConfig::LocalUnverifiedReadonlyFile { file_size, .. }
+            | FileConfig::RemoteUnverifiedReadonlyFile { file_size, .. }
+            | FileConfig::RemoteVerifiedReadonlyFile { file_size, .. } => {
+                create_stat(inode, *file_size, FileMode::ReadOnly)?
+            }
+            FileConfig::RemoteVerifiedNewFile { editor } => {
+                create_stat(inode, editor.size(), FileMode::ReadWrite)?
+            }
         };
         Ok(Entry {
             inode,
@@ -223,8 +233,15 @@ impl FileSystem for AuthFs {
     ) -> io::Result<(libc::stat64, Duration)> {
         Ok((
             match self.get_file_config(&inode)? {
-                FileConfig::LocalVerifiedFile(_, file_size)
-                | FileConfig::LocalUnverifiedFile(_, file_size) => create_stat(inode, *file_size)?,
+                FileConfig::LocalVerifiedReadonlyFile { file_size, .. }
+                | FileConfig::LocalUnverifiedReadonlyFile { file_size, .. }
+                | FileConfig::RemoteUnverifiedReadonlyFile { file_size, .. }
+                | FileConfig::RemoteVerifiedReadonlyFile { file_size, .. } => {
+                    create_stat(inode, *file_size, FileMode::ReadOnly)?
+                }
+                FileConfig::RemoteVerifiedNewFile { editor } => {
+                    create_stat(inode, editor.size(), FileMode::ReadWrite)?
+                }
             },
             DEFAULT_METADATA_TIMEOUT,
         ))
@@ -237,20 +254,28 @@ impl FileSystem for AuthFs {
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, fuse::sys::OpenOptions)> {
         // Since file handle is not really used in later operations (which use Inode directly),
-        // return None as the handle..
+        // return None as the handle.
         match self.get_file_config(&inode)? {
-            FileConfig::LocalVerifiedFile(_, _) => {
+            FileConfig::LocalVerifiedReadonlyFile { .. }
+            | FileConfig::RemoteVerifiedReadonlyFile { .. } => {
                 check_access_mode(flags, libc::O_RDONLY)?;
                 // Once verified, and only if verified, the file content can be cached. This is not
-                // really needed for a local file, but is the behavior of RemoteVerifiedFile later.
+                // really needed for a local file, but is the behavior of RemoteVerifiedReadonlyFile
+                // later.
                 Ok((None, fuse::sys::OpenOptions::KEEP_CACHE))
             }
-            FileConfig::LocalUnverifiedFile(_, _) => {
+            FileConfig::LocalUnverifiedReadonlyFile { .. }
+            | FileConfig::RemoteUnverifiedReadonlyFile { .. } => {
                 check_access_mode(flags, libc::O_RDONLY)?;
                 // Do not cache the content. This type of file is supposed to be verified using
                 // dm-verity. The filesystem mount over dm-verity already is already cached, so use
                 // direct I/O here to avoid double cache.
                 Ok((None, fuse::sys::OpenOptions::DIRECT_IO))
+            }
+            FileConfig::RemoteVerifiedNewFile { .. } => {
+                // No need to check access modes since all the modes are allowed to the
+                // read-writable file.
+                Ok((None, fuse::sys::OpenOptions::KEEP_CACHE))
             }
         }
     }
@@ -267,12 +292,45 @@ impl FileSystem for AuthFs {
         _flags: u32,
     ) -> io::Result<usize> {
         match self.get_file_config(&inode)? {
-            FileConfig::LocalVerifiedFile(file, file_size) => {
-                read_chunks(w, file, *file_size, offset, size)
+            FileConfig::LocalVerifiedReadonlyFile { reader, file_size } => {
+                read_chunks(w, reader, *file_size, offset, size)
             }
-            FileConfig::LocalUnverifiedFile(file, file_size) => {
-                read_chunks(w, file, *file_size, offset, size)
+            FileConfig::LocalUnverifiedReadonlyFile { reader, file_size } => {
+                read_chunks(w, reader, *file_size, offset, size)
             }
+            FileConfig::RemoteVerifiedReadonlyFile { reader, file_size } => {
+                read_chunks(w, reader, *file_size, offset, size)
+            }
+            FileConfig::RemoteUnverifiedReadonlyFile { reader, file_size } => {
+                read_chunks(w, reader, *file_size, offset, size)
+            }
+            FileConfig::RemoteVerifiedNewFile { editor } => {
+                // Note that with FsOptions::WRITEBACK_CACHE, it's possible for the kernel to
+                // request a read even if the file is open with O_WRONLY.
+                read_chunks(w, editor, editor.size(), offset, size)
+            }
+        }
+    }
+
+    fn write<R: io::Read + ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        _handle: Self::Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        match self.get_file_config(&inode)? {
+            FileConfig::RemoteVerifiedNewFile { editor } => {
+                let mut buf = vec![0; size as usize];
+                r.read_exact(&mut buf)?;
+                editor.write_at(&buf, offset)
+            }
+            _ => Err(io::Error::from_raw_os_error(libc::EBADF)),
         }
     }
 }
@@ -311,28 +369,4 @@ pub fn loop_forever(
         max_read,
         AuthFs::new(file_pool, max_write),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn collect_chunk_read_iter(remaining: usize, offset: u64) -> Vec<(u64, usize)> {
-        ChunkReadIter::new(remaining, offset).collect::<Vec<_>>()
-    }
-
-    #[test]
-    fn test_chunk_read_iter() {
-        assert_eq!(collect_chunk_read_iter(4096, 0), [(0, 4096)]);
-        assert_eq!(collect_chunk_read_iter(8192, 0), [(0, 4096), (4096, 4096)]);
-        assert_eq!(collect_chunk_read_iter(8192, 4096), [(4096, 4096), (8192, 4096)]);
-
-        assert_eq!(
-            collect_chunk_read_iter(16384, 1),
-            [(1, 4095), (4096, 4096), (8192, 4096), (12288, 4096), (16384, 1)]
-        );
-
-        assert_eq!(collect_chunk_read_iter(0, 0), []);
-        assert_eq!(collect_chunk_read_iter(0, 100), []);
-    }
 }

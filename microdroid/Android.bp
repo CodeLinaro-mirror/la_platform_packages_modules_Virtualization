@@ -14,14 +14,8 @@ microdroid_rootdirs = [
     "proc",
     "sys",
 
-    // TODO(b/180267599): clean up unnecessary partition mount points
     "system",
-    "system_ext",
     "vendor",
-    "vendor_dlkm",
-    "product",
-    "odm",
-    "odm_dlkm",
     "debug_ramdisk",
     "mnt",
 
@@ -43,9 +37,11 @@ android_filesystem {
     use_avb: true,
     avb_private_key: "microdroid.pem",
     avb_algorithm: "SHA256_RSA4096",
+    partition_name: "system",
     deps: [
         "init_second_stage",
         "microdroid_init_rc",
+        "ueventd.rc",
         "libbinder",
         "libstdc++",
         "logcat",
@@ -56,14 +52,24 @@ android_filesystem {
         "apexd",
         "debuggerd",
         "linker",
+        "linkerconfig",
         "servicemanager",
         "tombstoned",
         "cgroups.json",
+
+        "plat_sepolicy_and_mapping.sha256",
     ] + microdroid_shell_and_utilities,
     multilib: {
         common: {
             deps: [
                 "com.android.runtime",
+                "plat_sepolicy.cil",
+                "plat_mapping_file",
+                "plat_file_contexts",
+                "plat_hwservice_contexts",
+                "plat_property_contexts",
+                "plat_service_contexts",
+                "plat_keystore2_key_contexts",
             ],
         },
     },
@@ -81,17 +87,119 @@ prebuilt_etc {
     installable: false, // avoid collision with system partition's init.rc
 }
 
+android_filesystem {
+    name: "microdroid_vendor",
+    use_avb: true,
+    deps: [
+        "microdroid_plat_sepolicy_vers.txt",
+        "microdroid_precompiled_sepolicy",
+        "microdroid_precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+    ],
+    multilib: {
+        common: {
+            deps: [
+                "microdroid_vendor_sepolicy.cil",
+                "microdroid_plat_pub_versioned.cil",
+            ],
+        },
+    },
+    avb_private_key: "microdroid.pem",
+    avb_algorithm: "SHA256_RSA4096",
+    file_contexts: "microdroid_vendor_file_contexts",
+}
+
+prebuilt_etc {
+    name: "microdroid_plat_sepolicy_vers.txt",
+    src: "plat_sepolicy_vers.txt",
+    filename: "plat_sepolicy_vers.txt",
+    sub_dir: "selinux",
+    installable: false,
+}
+
+logical_partition {
+    name: "microdroid_super",
+    sparse: true,
+    // TODO(b/181107248): remove this hard-coded value
+    size: "104857600",
+    groups: [
+        {
+            name: "mygroup",
+            // TODO(b/181107248): remove this hard-coded value
+            size: "80000000",
+            partitions: [
+                {
+                    name: "system",
+                    filesystem: ":microdroid",
+                },
+                {
+                    name: "vendor",
+                    filesystem: ":microdroid_vendor",
+                },
+            ],
+        },
+    ],
+}
+
 bootimg {
-    name: "microdroid_vendor_boot-5.10",
+    name: "microdroid_boot-5.10",
     ramdisk_module: "microdroid_ramdisk-5.10",
+    // We don't have kernel for arm and x86. But Soong demands one when it builds for
+    // arm or x86 target. Satisfy that by providing an empty file as the kernel.
+    kernel_prebuilt: "empty_kernel",
+    arch: {
+        arm64: {
+            kernel_prebuilt: ":kernel_prebuilts-5.10-arm64",
+        },
+        x86_64: {
+            kernel_prebuilt: ":kernel_prebuilts-5.10-x86_64",
+        },
+    },
+    // TODO(jiyong): change the name to init, cause it's confusing
+    cmdline: "rdinit=/bin/init_vendor " +
+        "panic=-1 " +
+        // TODO(b/181936135) make the ratelimiting conditional; ratelimiting on prod build
+        "printk.devkmsg=on " +
+        "androidboot.first_stage_console=1 " +
+        "androidboot.hardware=microdroid " +
+        "androidboot.boot_devices=10000.pci ",
     dtb_prebuilt: "dummy_dtb.img",
-    header_version: "3",
-    vendor_boot: true,
-    partition_name: "vendor_boot",
+    header_version: "4",
+    partition_name: "boot",
+    use_avb: true,
+    avb_private_key: "microdroid.pem",
 }
 
 android_filesystem {
     name: "microdroid_ramdisk-5.10",
+    deps: [
+        "init_first_stage_soong",
+    ],
+    dirs: [
+        "dev",
+        "proc",
+        "sys",
+
+        // TODO(jiyong): remove these
+        "mnt",
+        "debug_ramdisk",
+        "second_stage_resources",
+    ],
+    type: "compressed_cpio",
+}
+
+bootimg {
+    name: "microdroid_vendor_boot-5.10",
+    ramdisk_module: "microdroid_vendor_ramdisk-5.10",
+    dtb_prebuilt: "dummy_dtb.img",
+    header_version: "4",
+    vendor_boot: true,
+    partition_name: "vendor_boot",
+    use_avb: true,
+    avb_private_key: "microdroid.pem",
+}
+
+android_filesystem {
+    name: "microdroid_vendor_ramdisk-5.10",
     arch: {
         arm64: {
             deps: ["virt_device_prebuilts_kernel_modules-5.10-arm64"],
@@ -100,5 +208,101 @@ android_filesystem {
             deps: ["virt_device_prebuilts_kernel_modules-5.10-x86_64"],
         },
     },
+    deps: [
+        "microdroid_fstab",
+    ],
+    base_dir: "first_stage_ramdisk",
     type: "compressed_cpio",
+    symlinks: [
+        {
+            target: "etc/fstab",
+            name: "first_stage_ramdisk/fstab.microdroid",
+        },
+        {
+            target: "first_stage_ramdisk/lib",
+            name: "lib",
+        },
+    ],
+}
+
+prebuilt_etc {
+    name: "microdroid_fstab",
+    src: "fstab",
+    filename: "fstab",
+    installable: false,
+}
+
+prebuilt_etc {
+    name: "microdroid_uboot_env",
+    src: ":microdroid_uboot_env_gen",
+    filename: "uboot_env.img",
+}
+
+genrule {
+    name: "microdroid_uboot_env_gen",
+    tools: ["mkenvimage_host"],
+    srcs: ["uboot-env.txt"],
+    out: ["output.img"],
+    cmd: "$(location mkenvimage_host) -s 4096 -o $(out) $(in)",
+}
+
+// sepolicy sha256 for vendor
+prebuilt_etc {
+    name: "microdroid_precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+    src: ":plat_sepolicy_and_mapping.sha256_gen",
+    filename: "precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+    relative_install_path: "selinux",
+    installable: false,
+}
+
+genrule {
+    name: "microdroid_precompiled_sepolicy_gen",
+    tools: ["secilc"],
+    srcs: [
+        ":plat_sepolicy.cil",
+        ":plat_mapping_file",
+        ":microdroid_plat_pub_versioned.cil",
+        ":microdroid_vendor_sepolicy.cil",
+    ],
+    out: ["precompiled_sepolicy"],
+    cmd: "$(location secilc) -m -M true -G -c 30 $(in) -o $(out) -f /dev/null",
+}
+
+prebuilt_etc {
+    name: "microdroid_precompiled_sepolicy",
+    src: ":microdroid_precompiled_sepolicy_gen",
+    filename: "precompiled_sepolicy",
+    relative_install_path: "selinux",
+    installable: false,
+}
+
+vbmeta {
+    name: "microdroid_vbmeta",
+    partition_name: "vbmeta",
+    private_key: "microdroid.pem",
+    partitions: [
+        "microdroid_vendor",
+        "microdroid_vendor_boot-5.10",
+    ],
+    chained_partitions: [
+        {
+            name: "vbmeta_system",
+            rollback_index_location: 1,
+            private_key: "microdroid.pem",
+        },
+        {
+            name: "boot",
+            rollback_index_location: 2,
+            private_key: "microdroid.pem",
+        },
+    ],
+}
+
+vbmeta {
+    name: "microdroid_vbmeta_system",
+    partition_name: "vbmeta_system",
+    private_key: "microdroid.pem",
+    partitions: [
+        "microdroid",
+    ],
 }
