@@ -49,6 +49,7 @@ apex {
 
         // tools to create composite images
         "mk_cdisk",
+        "mk_microdroid_signature",
         "mk_payload",
     ],
     prebuilts: [

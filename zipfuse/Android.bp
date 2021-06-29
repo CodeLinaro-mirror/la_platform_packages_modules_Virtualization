@@ -32,7 +32,6 @@ rust_test {
     name: "ZipFuseTest",
     stem: "zipfuse.test",
     defaults: ["zipfuse.defaults"],
-    test_suites: ["general-tests"],
     compile_multilib: "first",
     rustlibs: [
         "libnix",
